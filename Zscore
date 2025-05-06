@@ -1,0 +1,128 @@
+Absolutely — here’s the complete and final SQL that:
+	•	Calculates max per site/metric/day (rank = 1)
+	•	Computes average and standard deviation for 24 hours
+	•	Computes z-score
+	•	Flags outliers (z-score > 6)
+	•	If top value is an outlier, picks next non-outlier
+	•	Uses event_time DESC as tie-breaker when total values are the same
+
+⸻
+
+
+
+WITH aggregated_data AS (
+  SELECT
+    CASE 
+      WHEN metric_name = 'active_sessions_p90' THEN 'active_sessions'
+      WHEN metric_name = 'total_subscribers_p90' THEN 'total_subscribers'
+    END AS metric_name,
+    trans_dt,
+    site_name,
+    event_time,
+    local_event_time,
+    vendor,
+    fqdn,
+    group_key,
+    group_value,
+    fqdn_type,
+    primary_clli,
+    device_clli,
+    region,
+    area,
+    market,
+    latitude,
+    longitude,
+    value,
+    SUM(value) OVER (
+      PARTITION BY metric_name, site_name, trans_dt, event_time
+    ) AS total_value
+  FROM `vz-it-pr-gudv-dtwndo-0.aid_nwperf_aether_core_tbls_v.aether_smf_performance_derived_tbl`
+  WHERE trans_dt = DATE('2025-04-21')
+    AND LOWER(metric_name) IN (LOWER('active_sessions_p90'), LOWER('total_subscribers_p90'))
+),
+
+stats_per_day AS (
+  SELECT
+    metric_name,
+    site_name,
+    trans_dt,
+    AVG(total_value) AS avg_value,
+    STDDEV_POP(total_value) AS stddev_value
+  FROM aggregated_data
+  GROUP BY metric_name, site_name, trans_dt
+),
+
+ranked_data_with_zscore AS (
+  SELECT
+    a.*,
+    s.avg_value,
+    s.stddev_value,
+    SAFE_DIVIDE(total_value - s.avg_value, s.stddev_value) AS z_score,
+    RANK() OVER (
+      PARTITION BY a.metric_name, a.site_name, a.trans_dt
+      ORDER BY total_value DESC
+    ) AS rank,
+    ROW_NUMBER() OVER (
+      PARTITION BY a.trans_dt, a.metric_name, a.site_name, fqdn, group_value
+      ORDER BY total_value DESC, event_time DESC
+    ) AS tie_breaker
+  FROM aggregated_data a
+  JOIN stats_per_day s
+    ON a.metric_name = s.metric_name
+    AND a.site_name = s.site_name
+    AND a.trans_dt = s.trans_dt
+),
+
+final_selected_rows AS (
+  SELECT *
+  FROM ranked_data_with_zscore
+  WHERE 
+    -- Keep if top ranked value is not an outlier
+    (rank = 1 AND z_score <= 6)
+    -- Else, pick first available non-outlier in rank order
+    OR (
+      rank > 1 AND NOT EXISTS (
+        SELECT 1 FROM ranked_data_with_zscore r2
+        WHERE r2.metric_name = ranked_data_with_zscore.metric_name
+          AND r2.site_name = ranked_data_with_zscore.site_name
+          AND r2.trans_dt = ranked_data_with_zscore.trans_dt
+          AND r2.rank < ranked_data_with_zscore.rank
+          AND SAFE_DIVIDE(r2.total_value - r2.avg_value, r2.stddev_value) <= 6
+      )
+    )
+  QUALIFY tie_breaker = 1
+)
+
+SELECT 
+  '5g' AS technology,
+  trans_dt,
+  event_time,
+  local_event_time,
+  vendor,
+  fqdn AS device_name,
+  'smf' AS function_name,
+  metric_name,
+  value AS metric_value,
+  'count' AS metric_unit,
+  group_key,
+  group_value,
+  fqdn_type AS device_type,
+  primary_clli,
+  device_clli,
+  region,
+  site_name,
+  area,
+  market,
+  latitude,
+  longitude,
+  DATETIME(CURRENT_TIMESTAMP()) AS schedule_time,
+  CURRENT_TIMESTAMP() AS updated_timestamp,
+  z_score,
+  z_score > 6 AS is_outlier
+FROM final_selected_rows;
+
+
+
+⸻
+
+Let me know if you want to wrap this into a stored procedure or parameterize the trans_dt.
